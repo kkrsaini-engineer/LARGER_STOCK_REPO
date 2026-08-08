@@ -1,0 +1,29 @@
+# Core
+python-dotenv==1.0.1
+
+# Data handling
+pandas==2.2.2
+numpy==1.26.4
+
+# API requests (broker + telegram + external feeds)
+requests==2.32.3
+
+# Logging / utilities
+loguru==0.7.2
+
+# Testing
+pytest==8.2.2
+
+# Optional (only if you later add ML optimizer upgrades)
+scikit-learn==1.5.1
+
+# Plotting (for dashboard/report expansion)
+matplotlib==3.9.1
+
+# Time handling robustness
+pytz==2024.1
+
+yfinance==0.2.65
+ta==0.11.0
+
+openpyxl==3.1.5
