@@ -24,7 +24,7 @@ jobs:
 
       - name: Collect price and 1Y OHLCV
         run: |
-          python script/collect_price_ohlcv.py
+          python scripts/collect_price_ohlcv.py
 
       - name: Upload price data
         uses: actions/upload-artifact@v4
