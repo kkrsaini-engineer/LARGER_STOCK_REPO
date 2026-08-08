@@ -1,419 +1,294 @@
 """
-ONE-SHOT 5,552 STOCK DATA COLLECTOR
-===================================
+MASTER STOCK DATA COLLECTOR
+===========================
 
-Run once from GitHub Actions:
-
-    python scripts/collect_stock_data.py
+Collects market, fundamental, liquidity, classification and technical
+data for the 5,552-stock NSE+BSE universe.
 
 Input:
     latest_price_mapping_5552.csv
 
-Collects in one pipeline:
-- Current/previous OHLC, 52W high/low
-- 1D/1W/1M/3M/6M/1Y returns
-- 1Y historical OHLCV
-- Average/median volume
-- ADTV / median daily traded value
-- volume trend, volatility, gap frequency, ATR
-- SMA/EMA, RSI, MACD, ADX, Bollinger, Stochastic, ROC, momentum
-- yfinance fundamentals where supplied
-- NSE official daily bhavcopy fields when available
-- NSE delivery %, number of trades, traded value
-- NSE price band / surveillance / volatility / 52W data when available
-- AMFI Large/Mid/Small classification
-- NSE listing date/age from the supplied NSE master
-- NSE/BSE mapping from the supplied master CSV
-
-Important:
-Missing source data is stored as blank/NA. Nothing is guessed.
-Bid/ask is not stored as a fake historical value; it requires live market
-depth/broker data and is marked unavailable.
-
 Outputs:
-    data/master_stock_data.csv
+    data/stock_master_data.csv
+    data/stock_ohlcv/*.csv
     data/collection_errors.csv
-    data/ohlcv_1y/<ticker>.csv
-    data/raw_sources/*.csv
+
+Primary sources:
+    - yfinance for quotes, fundamentals and historical OHLCV
+    - NSE/BSE master mapping already present in input CSV
+    - Derived metrics calculated locally from OHLCV
+
+Notes:
+    NSE/BSE-specific delivery, trades, ASM/GSM, circuit and surveillance
+    fields are left as columns for later official-source wiring if not
+    available from yfinance. The collector does not invent missing values.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
-import re
-import sys
+import math
+import os
 import time
-import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
 
 ROOT = Path(__file__).resolve().parents[1]
-INPUT = ROOT / "latest_price_mapping_5552.csv"
-OUT = ROOT / "data"
-RAW = OUT / "raw_sources"
-HISTORY = OUT / "ohlcv_1y"
+DEFAULT_INPUT = ROOT / "latest_price_mapping_5552.csv"
+DATA_DIR = ROOT / "data"
+HISTORY_DIR = DATA_DIR / "stock_ohlcv"
 
-OUT.mkdir(parents=True, exist_ok=True)
-RAW.mkdir(parents=True, exist_ok=True)
-HISTORY.mkdir(parents=True, exist_ok=True)
-
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151.0 Safari/537.36"
-)
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-})
-
-NSE_ARCHIVE = "https://nsearchives.nseindia.com"
-NSE_HOME = "https://www.nseindia.com"
+HISTORY_PERIOD = "1y"
+HISTORY_INTERVAL = "1d"
+BATCH_SIZE = 50
+MAX_WORKERS = 6
+RETRIES = 3
 
 
-def num(x):
+def clean_number(value):
     try:
-        if x is None or pd.isna(x):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
             return np.nan
-        return float(x)
-    except Exception:
+        return float(value)
+    except (TypeError, ValueError):
         return np.nan
 
 
-def first(*values):
-    for x in values:
-        if x is not None:
+def first_valid(*values):
+    for value in values:
+        if value is not None:
             try:
-                if not pd.isna(x):
-                    return x
-            except Exception:
-                return x
+                if not pd.isna(value):
+                    return value
+            except (TypeError, ValueError):
+                return value
     return np.nan
 
 
-def clean_columns(df):
-    df = df.copy()
-    df.columns = [
-        re.sub(r"\s+", " ", str(c).strip()).upper()
-        for c in df.columns
-    ]
-    return df
-
-
-def find_col(df, *names):
-    cols = {str(c).strip().upper(): c for c in df.columns}
-    for name in names:
-        if name.upper() in cols:
-            return cols[name.upper()]
-    for c in df.columns:
-        u = str(c).upper()
-        if any(name.upper() in u for name in names):
-            return c
-    return None
-
-
-def get_nse_archive(url, timeout=30):
-    r = SESSION.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.content
-
-
-def trading_date():
-    # NSE reports are EOD. On weekends/holidays, walk backwards.
-    d = datetime.now().date()
-    for _ in range(10):
-        if d.weekday() < 5:
-            return d
-        d -= timedelta(days=1)
-    return d
-
-
-def nse_bhavcopy(date):
-    ds = date.strftime("%d%m%Y")
-    urls = [
-        f"{NSE_ARCHIVE}/products/content/sec_bhavdata_full_{ds}.csv",
-        f"{NSE_ARCHIVE}/content/historical/EQUITIES/{date.strftime('%Y')}/"
-        f"CM_{date.strftime('%d%b%Y').upper()}_1.csv",
-    ]
-    for url in urls:
-        try:
-            raw = get_nse_archive(url)
-            df = pd.read_csv(io.BytesIO(raw))
-            df = clean_columns(df)
-            if "SYMBOL" in df.columns:
-                return df
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-
-def nse_report_from_all_reports(date, keyword):
-    """
-    Best-effort discovery from NSE's public All Reports page.
-    Used for reports whose archive filename changes.
-    """
+def safe_info(ticker: yf.Ticker) -> dict:
     try:
-        r = SESSION.get(
-            f"{NSE_HOME}/all-reports",
-            params={"type": "equities"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        html = r.text
+        return ticker.info or {}
     except Exception:
-        return pd.DataFrame()
-
-    matches = []
-    for href, text in re.findall(
-        r'href=["\']([^"\']+)["\'][^>]*>(.*?)</',
-        html,
-        flags=re.I | re.S,
-    ):
-        label = re.sub(r"<.*?>", " ", text)
-        label = re.sub(r"\s+", " ", label).strip()
-        if keyword.lower() in label.lower() or keyword.lower() in href.lower():
-            matches.append(urljoin(NSE_HOME, href))
-
-    for url in matches[:10]:
-        try:
-            raw = get_nse_archive(url)
-            if url.lower().endswith(".zip"):
-                z = zipfile.ZipFile(io.BytesIO(raw))
-                for member in z.namelist():
-                    if member.lower().endswith((".csv", ".dat")):
-                        data = z.read(member)
-                        df = pd.read_csv(io.BytesIO(data), sep=None, engine="python")
-                        return clean_columns(df)
-            else:
-                return clean_columns(
-                    pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
-                )
-        except Exception:
-            continue
-
-    return pd.DataFrame()
-
-
-def normalize_nse_daily(df):
-    if df.empty or "SYMBOL" not in df.columns:
-        return pd.DataFrame()
-
-    out = pd.DataFrame()
-    out["NSE_SYMBOL"] = df["SYMBOL"].astype(str).str.strip().str.upper()
-
-    mapping = {
-        "OPEN": ["OPEN"],
-        "HIGH": ["HIGH"],
-        "LOW": ["LOW"],
-        "CLOSE": ["CLOSE"],
-        "PREV_CLOSE": ["PREV_CLOSE", "PREVCLOSE", "PREV CLOSE"],
-        "VOLUME": ["TTL_TRD_QNTY", "TOTTRDQTY", "TOTAL TRADED QUANTITY"],
-        "TRADED_VALUE": ["TURNOVER_LACS", "TOTTRDVAL", "TOTAL TRADED VALUE"],
-        "DELIVERY_QTY": ["DELIV_QTY", "DELIVERY QTY"],
-        "DELIVERY_PCT": ["DELIV_PER", "DELIVERY PERCENTAGE"],
-        "NO_OF_TRADES": ["NO_OF_TRADES", "NO OF TRADES"],
-        "SERIES": ["SERIES"],
-    }
-
-    for target, names in mapping.items():
-        c = find_col(df, *names)
-        out[target] = df[c] if c else np.nan
-
-    for c in [
-        "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE", "VOLUME",
-        "TRADED_VALUE", "DELIVERY_QTY", "DELIVERY_PCT", "NO_OF_TRADES"
-    ]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    return out.drop_duplicates("NSE_SYMBOL")
-
-
-def load_amfi_classification():
-    """
-    Finds the 2026 Jan-Jun Excel link from AMFI's official classification page.
-    """
-    url = "https://www.amfiindia.com/otherdata/categorisation-of-stocks"
-    try:
-        r = SESSION.get(url, timeout=30)
-        r.raise_for_status()
-        html = r.text
-    except Exception:
-        return pd.DataFrame()
-
-    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I)
-
-    candidates = []
-    for href in hrefs:
-        h = href.lower()
-        if ("2026" in h or "2026" in r.text.lower()) and (
-            ".xls" in h or ".xlsx" in h
-        ):
-            candidates.append(urljoin(url, href))
-
-    # Prefer files around the Jan-Jun 2026 section.
-    for href in candidates:
-        try:
-            raw = SESSION.get(href, timeout=30).content
-            df = pd.read_excel(io.BytesIO(raw))
-            df = clean_columns(df)
-
-            text = " ".join(map(str, df.columns))
-            if any(x in text for x in ["ISIN", "COMPANY", "NAME"]):
-                return df
-        except Exception:
-            continue
-
-    return pd.DataFrame()
-
-
-def technicals(df):
-    if df.empty:
         return {}
 
-    close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    volume = df["Volume"].astype(float)
 
-    prev = close.shift(1)
-    tr = pd.concat(
+def safe_fast_info(ticker: yf.Ticker) -> dict:
+    try:
+        return dict(ticker.fast_info)
+    except Exception:
+        return {}
+
+
+def fetch_history(symbol: str) -> pd.DataFrame:
+    last_error = None
+
+    for attempt in range(RETRIES):
+        try:
+            df = yf.download(
+                symbol,
+                period=HISTORY_PERIOD,
+                interval=HISTORY_INTERVAL,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
+            if df is None or df.empty:
+                raise ValueError("No OHLCV data returned")
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            required = ["Open", "High", "Low", "Close", "Volume"]
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                raise ValueError(f"Missing OHLCV columns: {missing}")
+
+            df = df[required].copy()
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            df = df.dropna(subset=["Close"])
+
+            return df
+
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError(f"History failed for {symbol}: {last_error}")
+
+
+def pct_return(close: pd.Series, days: int):
+    if len(close) <= days:
+        return np.nan
+    old = clean_number(close.iloc[-days - 1])
+    new = clean_number(close.iloc[-1])
+    if pd.isna(old) or old == 0 or pd.isna(new):
+        return np.nan
+    return (new / old - 1.0) * 100.0
+
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    return pd.concat(
         [
-            high - low,
-            (high - prev).abs(),
-            (low - prev).abs(),
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    atr14 = tr.rolling(14).mean()
 
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    ag = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    al = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    rs = ag / al.replace(0, np.nan)
-    rsi14 = 100 - 100 / (1 + rs)
 
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    return true_range(df).rolling(period).mean()
+
+
+def macd(close: pd.Series):
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    line = ema12 - ema26
+    signal = line.ewm(span=9, adjust=False).mean()
+    return line, signal
 
-    up = high.diff()
-    down = -low.diff()
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
     plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0.0),
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
         index=df.index,
     )
     minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0.0),
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
         index=df.index,
     )
-    atr14_for_adx = tr.rolling(14).mean()
-    plus_di = 100 * plus_dm.rolling(14).mean() / atr14_for_adx
-    minus_di = 100 * minus_dm.rolling(14).mean() / atr14_for_adx
-    dx = 100 * (plus_di - minus_di).abs() / (
-        plus_di + minus_di
-    ).replace(0, np.nan)
-    adx14 = dx.rolling(14).mean()
 
-    bb_mid = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
+    tr = true_range(df)
+    atr_val = tr.rolling(period).mean()
 
-    st_low = low.rolling(14).min()
-    st_high = high.rolling(14).max()
-    stoch = 100 * (close - st_low) / (st_high - st_low).replace(0, np.nan)
+    plus_di = 100 * plus_dm.rolling(period).mean() / atr_val
+    minus_di = 100 * minus_dm.rolling(period).mean() / atr_val
 
-    daily_ret = close.pct_change()
-    gaps = (df["Open"] / prev - 1).abs() * 100
+    dx = (
+        100
+        * (plus_di - minus_di).abs()
+        / (plus_di + minus_di).replace(0, np.nan)
+    )
+
+    return dx.rolling(period).mean()
+
+
+def bollinger(close: pd.Series, period: int = 20, std_mult: float = 2):
+    mid = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    return mid, mid + std_mult * std, mid - std_mult * std
+
+
+def stochastic(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    low = df["Low"].rolling(period).min()
+    high = df["High"].rolling(period).max()
+    return 100 * (df["Close"] - low) / (high - low).replace(0, np.nan)
+
+
+def technical_metrics(df: pd.DataFrame) -> dict:
+    close = df["Close"].astype(float)
+    volume = df["Volume"].astype(float)
+
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    sma100 = close.rolling(100).mean()
+    sma200 = close.rolling(200).mean()
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    rsi14 = rsi(close)
+    atr14 = atr(df)
+    adx14 = adx(df)
+    macd_line, macd_signal = macd(close)
+    bb_mid, bb_upper, bb_lower = bollinger(close)
+    stoch14 = stochastic(df)
+
+    returns = close.pct_change()
+    daily_vol = returns.rolling(20).std() * np.sqrt(252) * 100
+
+    gaps = (df["Open"] / df["Close"].shift(1) - 1).abs() * 100
+    gap_frequency_8 = (gaps.tail(90) > 8).mean() * 100
+
+    median_volume = volume.tail(252).median()
+    avg_volume = volume.tail(20).mean()
 
     traded_value = close * volume
-    avg_vol20 = volume.tail(20).mean()
-    med_vol252 = volume.tail(252).median()
-    adtv20 = traded_value.tail(20).mean()
-    med_dtv252 = traded_value.tail(252).median()
+    adtv = traded_value.tail(20).mean()
+    median_dtv = traded_value.tail(252).median()
 
-    high52 = close.tail(252).max()
-    low52 = close.tail(252).min()
+    vol_ratio = volume.iloc[-1] / avg_volume if avg_volume else np.nan
 
-    def ret(n):
-        if len(close) <= n:
-            return np.nan
-        old = close.iloc[-n - 1]
-        return (close.iloc[-1] / old - 1) * 100 if old else np.nan
+    high_52 = close.tail(252).max()
+    low_52 = close.tail(252).min()
+
+    latest = df.iloc[-1]
 
     return {
-        "price": close.iloc[-1],
-        "previous_close": prev.iloc[-1],
-        "open": df["Open"].iloc[-1],
-        "day_high": high.iloc[-1],
-        "day_low": low.iloc[-1],
-        "52w_high": high52,
-        "52w_low": low52,
-        "return_1d_pct": ret(1),
-        "return_1w_pct": ret(5),
-        "return_1m_pct": ret(21),
-        "return_3m_pct": ret(63),
-        "return_6m_pct": ret(126),
-        "return_1y_pct": ret(252),
-        "average_volume_20": avg_vol20,
-        "median_volume_252": med_vol252,
-        "adtv_20_inr": adtv20,
-        "median_daily_traded_value_252_inr": med_dtv252,
-        "volume_ratio_20": (
-            volume.iloc[-1] / avg_vol20 if avg_vol20 else np.nan
-        ),
+        "average_volume_20": avg_volume,
+        "median_volume_252": median_volume,
+        "adtv_20_inr": adtv,
+        "median_daily_traded_value_252_inr": median_dtv,
+        "volume_ratio_20": vol_ratio,
         "volume_trend_20_vs_50": (
             volume.tail(20).mean() / volume.tail(50).mean()
             if volume.tail(50).mean()
             else np.nan
         ),
-        "annualized_volatility_20_pct": (
-            daily_ret.tail(20).std() * np.sqrt(252) * 100
-        ),
-        "gap_frequency_gt_8pct_90d": (
-            (gaps.tail(90) > 8).mean() * 100
-        ),
+        "annualized_volatility_20_pct": daily_vol.iloc[-1],
+        "gap_frequency_gt_8pct_90d": gap_frequency_8,
         "atr_14": atr14.iloc[-1],
         "atr_14_pct": (
             atr14.iloc[-1] / close.iloc[-1] * 100
             if close.iloc[-1]
             else np.nan
         ),
-        "sma_20": close.rolling(20).mean().iloc[-1],
-        "sma_50": close.rolling(50).mean().iloc[-1],
-        "sma_100": close.rolling(100).mean().iloc[-1],
-        "sma_200": close.rolling(200).mean().iloc[-1],
-        "ema_20": close.ewm(span=20, adjust=False).mean().iloc[-1],
-        "ema_50": close.ewm(span=50, adjust=False).mean().iloc[-1],
-        "ema_200": close.ewm(span=200, adjust=False).mean().iloc[-1],
+        "sma_20": sma20.iloc[-1],
+        "sma_50": sma50.iloc[-1],
+        "sma_100": sma100.iloc[-1],
+        "sma_200": sma200.iloc[-1],
+        "ema_20": ema20.iloc[-1],
+        "ema_50": ema50.iloc[-1],
+        "ema_200": ema200.iloc[-1],
         "rsi_14": rsi14.iloc[-1],
-        "macd": macd.iloc[-1],
+        "macd": macd_line.iloc[-1],
         "macd_signal": macd_signal.iloc[-1],
         "adx_14": adx14.iloc[-1],
-        "bollinger_middle_20": bb_mid.iloc[-1],
-        "bollinger_upper_20": bb_upper.iloc[-1],
-        "bollinger_lower_20": bb_lower.iloc[-1],
-        "stochastic_14": stoch.iloc[-1],
+        "bb_middle_20": bb_mid.iloc[-1],
+        "bb_upper_20": bb_upper.iloc[-1],
+        "bb_lower_20": bb_lower.iloc[-1],
+        "stochastic_14": stoch14.iloc[-1],
         "roc_20_pct": (
             (close.iloc[-1] / close.iloc[-21] - 1) * 100
-            if len(close) > 20
+            if len(close) > 20 and close.iloc[-21] != 0
             else np.nan
         ),
         "momentum_20": (
@@ -421,41 +296,42 @@ def technicals(df):
             if len(close) > 20
             else np.nan
         ),
-        "52w_breakout": bool(close.iloc[-1] >= high52),
+        "high_52w": high_52,
+        "low_52w": low_52,
         "distance_from_52w_high_pct": (
-            (close.iloc[-1] / high52 - 1) * 100
-            if high52
+            (close.iloc[-1] / high_52 - 1) * 100
+            if high_52
             else np.nan
+        ),
+        "breakout_52w": bool(
+            len(close) > 20 and close.iloc[-1] >= high_52
         ),
         "trend_regime": (
             "BULLISH"
-            if close.iloc[-1] > close.ewm(span=50, adjust=False).mean().iloc[-1]
-            > close.ewm(span=200, adjust=False).mean().iloc[-1]
+            if close.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1]
             else "BEARISH"
-            if close.iloc[-1] < close.ewm(span=50, adjust=False).mean().iloc[-1]
-            < close.ewm(span=200, adjust=False).mean().iloc[-1]
+            if close.iloc[-1] < ema50.iloc[-1] < ema200.iloc[-1]
             else "MIXED"
         ),
         "volume_breakout": bool(
-            avg_vol20 and volume.iloc[-1] >= avg_vol20 * 2
+            avg_volume > 0 and volume.iloc[-1] >= avg_volume * 2
         ),
-        "latest_volume": volume.iloc[-1],
-        "history_date": str(df.index[-1].date()),
+        "latest_ohlcv_date": str(df.index[-1].date()),
+        "latest_open": latest["Open"],
+        "latest_high": latest["High"],
+        "latest_low": latest["Low"],
+        "latest_close": latest["Close"],
+        "latest_volume": latest["Volume"],
+        "return_1d_pct": pct_return(close, 1),
+        "return_1w_pct": pct_return(close, 5),
+        "return_1m_pct": pct_return(close, 21),
+        "return_3m_pct": pct_return(close, 63),
+        "return_6m_pct": pct_return(close, 126),
+        "return_1y_pct": pct_return(close, 252),
     }
 
 
-def yf_fundamentals(symbol):
-    t = yf.Ticker(symbol)
-    try:
-        info = t.info or {}
-    except Exception:
-        info = {}
-
-    try:
-        fast = dict(t.fast_info)
-    except Exception:
-        fast = {}
-
+def fundamental_metrics(info: dict, fast: dict) -> dict:
     keys = {
         "market_cap": "marketCap",
         "enterprise_value": "enterpriseValue",
@@ -482,288 +358,275 @@ def yf_fundamentals(symbol):
         "book_value": "bookValue",
         "shares_outstanding": "sharesOutstanding",
         "float_shares": "floatShares",
-        "promoter_holding_proxy": "heldPercentInsiders",
-        "institutional_holding_proxy": "heldPercentInstitutions",
+        "held_percent_insiders": "heldPercentInsiders",
+        "held_percent_institutions": "heldPercentInstitutions",
     }
 
-    out = {k: info.get(v, np.nan) for k, v in keys.items()}
+    result = {out: info.get(key, np.nan) for out, key in keys.items()}
 
-    out["price"] = first(
+    result["promoter_holding"] = result["held_percent_insiders"]
+    result["fii_dii_holding"] = result["held_percent_institutions"]
+
+    result["price"] = first_valid(
         fast.get("last_price"),
         info.get("currentPrice"),
         info.get("regularMarketPrice"),
     )
-    out["previous_close"] = first(
+    result["previous_close"] = first_valid(
         fast.get("previous_close"),
         info.get("previousClose"),
+        info.get("regularMarketPreviousClose"),
     )
-    out["sector"] = info.get("sector", np.nan)
-    out["industry"] = info.get("industry", np.nan)
+    result["day_high"] = first_valid(
+        fast.get("day_high"),
+        info.get("dayHigh"),
+    )
+    result["day_low"] = first_valid(
+        fast.get("day_low"),
+        info.get("dayLow"),
+    )
+    result["52w_high"] = first_valid(
+        fast.get("year_high"),
+        info.get("fiftyTwoWeekHigh"),
+    )
+    result["52w_low"] = first_valid(
+        fast.get("year_low"),
+        info.get("fiftyTwoWeekLow"),
+    )
 
-    # These are intentionally NOT renamed as actual FII/DII/promoter values.
-    # Yahoo's institutional/insider fields are only proxies.
-    return out
+    return result
 
 
-def fetch_one(row):
-    row = dict(row)
-    ticker = str(row.get("PRICE_TICKER", "")).strip()
-
-    if not ticker:
-        row["fetch_status"] = "ERROR"
-        row["error"] = "missing ticker"
-        return row, None
+def collect_one(row: dict) -> tuple[dict, pd.DataFrame | None, str | None]:
+    ticker_symbol = str(row.get("PRICE_TICKER", "")).strip()
+    if not ticker_symbol:
+        return row, None, "Missing PRICE_TICKER"
 
     try:
-        hist = yf.download(
-            ticker,
-            period="1y",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
+        ticker = yf.Ticker(ticker_symbol)
+        info = safe_info(ticker)
+        fast = safe_fast_info(ticker)
+        history = fetch_history(ticker_symbol)
 
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-
-        hist = hist[["Open", "High", "Low", "Close", "Volume"]].dropna(
-            subset=["Close"]
-        )
-
-        if hist.empty:
-            raise ValueError("no OHLCV returned")
+        metrics = {}
+        metrics.update(fundamental_metrics(info, fast))
+        metrics.update(technical_metrics(history))
 
         result = dict(row)
-        result.update(technicals(hist))
-        result.update(yf_fundamentals(ticker))
 
-        # Official-source fields populated after daily NSE merge.
+        # Remove old blank price fields before filling actual values.
+        result.update(metrics)
+
+        # yfinance identity fields where available.
+        result["sector"] = info.get("sector", np.nan)
+        result["industry"] = info.get("industry", np.nan)
+        result["business_summary"] = info.get("longBusinessSummary", np.nan)
+
+        # Explicit placeholders for data that needs official NSE/BSE sources.
+        result["total_traded_value"] = np.nan
+        result["number_of_trades"] = np.nan
+        result["delivery_pct"] = np.nan
+        result["free_float"] = first_valid(
+            info.get("floatShares"),
+            info.get("sharesOutstanding"),
+        )
+        result["bid"] = np.nan
+        result["ask"] = np.nan
+        result["upper_circuit"] = np.nan
+        result["lower_circuit"] = np.nan
+        result["price_band"] = np.nan
+        result["asm_status"] = np.nan
+        result["gsm_status"] = np.nan
+        result["surveillance_indicator"] = np.nan
+        result["promoter_pledge"] = np.nan
+        result["dii_holding"] = np.nan
+        result["fii_holding"] = np.nan
+        result["large_mid_small_cap"] = np.nan
+        result["listing_age_years"] = np.nan
+
         result["fetch_status"] = "OK"
-        result["error"] = ""
 
-        return result, hist
+        return result, history, None
 
     except Exception as exc:
-        row["fetch_status"] = "ERROR"
-        row["error"] = str(exc)
-        return row, None
-
-
-def merge_nse_daily(master, daily):
-    if daily.empty:
-        return master
-
-    master = master.copy()
-    daily = daily.copy()
-
-    # Only NSE-listed rows can be matched by NSE symbol.
-    if "NSE_SYMBOL" not in master.columns:
-        return master
-
-    merged = master.merge(
-        daily,
-        on="NSE_SYMBOL",
-        how="left",
-        suffixes=("", "_NSE"),
-    )
-
-    for c in [
-        "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE", "VOLUME",
-        "TRADED_VALUE", "DELIVERY_QTY", "DELIVERY_PCT", "NO_OF_TRADES",
-        "SERIES"
-    ]:
-        src = c
-        if src in merged.columns:
-            target = {
-                "OPEN": "nse_open",
-                "HIGH": "nse_high",
-                "LOW": "nse_low",
-                "CLOSE": "nse_close",
-                "PREV_CLOSE": "nse_previous_close",
-                "VOLUME": "nse_traded_quantity",
-                "TRADED_VALUE": "nse_traded_value",
-                "DELIVERY_QTY": "nse_delivery_quantity",
-                "DELIVERY_PCT": "delivery_pct",
-                "NO_OF_TRADES": "number_of_trades",
-                "SERIES": "nse_series",
-            }[c]
-            merged[target] = merged[src]
-
-    # Daily traded value in some NSE reports is in lakh rupees.
-    if "nse_traded_value" in merged.columns:
-        # Keep source value and provide an explicit INR estimate.
-        merged["nse_traded_value_inr"] = pd.to_numeric(
-            merged["nse_traded_value"], errors="coerce"
-        )
-        merged["nse_traded_value_inr"] = merged["nse_traded_value_inr"] * 100000
-
-    return merged.drop(columns=[
-        c for c in [
-            "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE", "VOLUME",
-            "TRADED_VALUE", "DELIVERY_QTY", "DELIVERY_PCT",
-            "NO_OF_TRADES", "SERIES"
-        ] if c in merged.columns])
+        result = dict(row)
+        result["fetch_status"] = "ERROR"
+        return result, None, str(exc)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default=str(INPUT))
-    ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--limit", type=int, default=0)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default=str(DEFAULT_INPUT))
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--limit", type=int, default=0)
+    args = parser.parse_args()
 
-    universe = pd.read_csv(args.input, dtype=str).fillna("")
-    if args.limit:
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+    universe = pd.read_csv(input_path, dtype=str).fillna("")
+
+    if args.limit > 0:
         universe = universe.head(args.limit)
 
-    print(f"Universe: {len(universe)}")
-
-    # 1) One NSE daily official fetch for all NSE symbols.
-    date = trading_date()
-    print(f"Fetching NSE official daily data for {date}...")
-    daily = normalize_nse_daily(nse_bhavcopy(date))
-
-    if not daily.empty:
-        daily.to_csv(RAW / f"nse_bhavcopy_{date:%Y%m%d}.csv", index=False)
-        print(f"NSE daily rows: {len(daily)}")
-    else:
-        print("WARNING: NSE daily bhavcopy unavailable.")
-
-    # 2) AMFI current classification.
-    print("Fetching AMFI 2026 Jan-Jun classification...")
-    amfi = load_amfi_classification()
-
-    if not amfi.empty:
-        amfi.to_csv(RAW / "amfi_2026_jan_jun.csv", index=False)
-        print(f"AMFI rows: {len(amfi)}")
-    else:
-        print("WARNING: AMFI classification unavailable.")
-
-    # 3) One 1Y OHLCV + fundamental fetch per mapped ticker.
     rows = universe.to_dict("records")
     results = []
     errors = []
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(fetch_one, r): r for r in rows}
+    print(f"Universe: {len(rows)}")
+    print(f"Workers: {args.workers}")
 
-        for i, future in enumerate(as_completed(futures), 1):
-            result, hist = future.result()
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(collect_one, row): row for row in rows
+        }
+
+        for index, future in enumerate(as_completed(futures), start=1):
+            result, history, error = future.result()
             results.append(result)
 
-            if hist is not None:
-                ticker = result.get("PRICE_TICKER", "unknown")
-                safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ticker)
-                hist.to_csv(HISTORY / f"{safe}.csv")
+            ticker = result.get("PRICE_TICKER", "")
+            if history is not None and ticker:
+                safe_name = ticker.replace("/", "_").replace("\\", "_")
+                history.to_csv(HISTORY_DIR / f"{safe_name}.csv")
 
-            if result.get("fetch_status") == "ERROR":
-                errors.append({
-                    "ISIN": result.get("ISIN", ""),
-                    "PRICE_TICKER": result.get("PRICE_TICKER", ""),
-                    "error": result.get("error", ""),
-                })
+            if error:
+                errors.append(
+                    {
+                        "ISIN": result.get("ISIN", ""),
+                        "PRICE_TICKER": ticker,
+                        "error": error,
+                    }
+                )
 
-            if i % 25 == 0 or i == len(rows):
+            if index % 25 == 0 or index == len(rows):
                 print(
-                    f"Progress {i}/{len(rows)} | errors={len(errors)}"
+                    f"Progress: {index}/{len(rows)} | "
+                    f"Errors: {len(errors)}"
                 )
 
     master = pd.DataFrame(results)
 
-    # 4) Merge official NSE daily data.
-    master = merge_nse_daily(master, daily)
-
-    # 5) AMFI classification by ISIN where possible.
-    if not amfi.empty and "ISIN" in master.columns:
-        amfi = clean_columns(amfi)
-
-        isin_col = find_col(amfi, "ISIN", "ISIN CODE")
-        class_col = find_col(
-            amfi,
-            "CLASSIFICATION",
-            "CATEGORY",
-            "CAP CATEGORY",
-            "TYPE",
-        )
-
-        if isin_col and class_col:
-            ac = amfi[[isin_col, class_col]].copy()
-            ac.columns = ["ISIN", "large_mid_small_cap"]
-            ac["ISIN"] = ac["ISIN"].astype(str).str.strip().str.upper()
-            ac = ac.drop_duplicates("ISIN")
-            master["ISIN"] = master["ISIN"].astype(str).str.strip().str.upper()
-            master = master.merge(ac, on="ISIN", how="left", suffixes=("", "_AMFI"))
-
-    # 6) Listing age from existing exchange master dates.
-    today = pd.Timestamp.today().normalize()
-    listing_col = None
-    for c in ["NSE_LISTING_DATE", "BSE_LISTING_DATE"]:
-        if c in master.columns:
-            listing_col = c
-            break
-
-    if listing_col:
-        dt = pd.to_datetime(master[listing_col], errors="coerce")
-        master["listing_age_years"] = (
-            (today - dt).dt.days / 365.25
-        )
-
-    # 7) Required fields that cannot safely be obtained historically
-    # from yfinance are explicitly marked NA.
-    unavailable = [
+    preferred_order = [
+        "ISIN",
+        "COMPANY",
+        "NSE_SYMBOL",
+        "BSE_SYMBOL",
+        "BSE_CODE",
+        "EXCHANGE",
+        "PRICE_TICKER",
+        "fetch_status",
+        "price",
+        "previous_close",
+        "latest_open",
+        "latest_high",
+        "latest_low",
+        "latest_close",
+        "52w_high",
+        "52w_low",
+        "return_1d_pct",
+        "return_1w_pct",
+        "return_1m_pct",
+        "return_3m_pct",
+        "return_6m_pct",
+        "return_1y_pct",
+        "average_volume_20",
+        "median_volume_252",
+        "adtv_20_inr",
+        "median_daily_traded_value_252_inr",
+        "volume_ratio_20",
+        "volume_trend_20_vs_50",
+        "annualized_volatility_20_pct",
+        "gap_frequency_gt_8pct_90d",
+        "atr_14",
+        "atr_14_pct",
+        "total_traded_value",
+        "number_of_trades",
+        "delivery_pct",
+        "free_float",
         "bid",
         "ask",
-        "promoter_pledge",
-        "fii_holding",
-        "dii_holding",
         "upper_circuit",
         "lower_circuit",
         "price_band",
         "asm_status",
         "gsm_status",
         "surveillance_indicator",
+        "market_cap",
+        "enterprise_value",
+        "revenue",
+        "revenue_growth",
+        "ebitda",
+        "ebitda_margin",
+        "ebit",
+        "net_profit",
+        "eps",
+        "eps_growth",
+        "pe_ratio",
+        "forward_pe",
+        "pb_ratio",
+        "ps_ratio",
+        "roe",
+        "roa",
         "roce",
+        "debt",
+        "debt_to_equity",
+        "current_ratio",
+        "free_cash_flow",
+        "operating_cash_flow",
+        "dividend_yield",
+        "book_value",
+        "promoter_holding",
+        "promoter_pledge",
+        "fii_holding",
+        "dii_holding",
+        "sector",
+        "industry",
+        "large_mid_small_cap",
+        "NSE_LISTING_DATE",
+        "BSE_LISTING_DATE",
+        "listing_age_years",
+        "NSE_SYMBOL",
+        "BSE_SYMBOL",
+        "BSE_CODE",
+        "SME_FLAG",
+        "BSE_EXCLUSIVE",
+        "business_summary",
     ]
-    for c in unavailable:
-        if c not in master.columns:
-            master[c] = np.nan
 
-    # Fallback price fields.
-    if "price" not in master:
-        master["price"] = np.nan
+    # Add ROCE explicitly if it was not available from yfinance.
+    if "roce" not in master.columns:
+        master["roce"] = np.nan
 
-    if "latest_close" not in master and "latest_close" not in master.columns:
-        master["latest_close"] = master.get("price", np.nan)
+    # Only keep columns that exist, preserving useful extras at the end.
+    ordered = [c for c in preferred_order if c in master.columns]
+    extras = [c for c in master.columns if c not in ordered]
+    master = master[ordered + extras]
 
-    # Save master.
-    master.to_csv(OUT / "master_stock_data.csv", index=False)
+    master.to_csv(DATA_DIR / "stock_master_data.csv", index=False)
 
-    pd.DataFrame(errors).to_csv(
-        OUT / "collection_errors.csv",
-        index=False,
-    )
+    if errors:
+        pd.DataFrame(errors).to_csv(
+            DATA_DIR / "collection_errors.csv",
+            index=False,
+        )
+    else:
+        pd.DataFrame(
+            columns=["ISIN", "PRICE_TICKER", "error"]
+        ).to_csv(DATA_DIR / "collection_errors.csv", index=False)
 
-    # Small machine-readable run summary.
-    summary = {
-        "run_date": str(date),
-        "universe": len(universe),
-        "rows_output": len(master),
-        "successful_ohlcv": int((master["fetch_status"] == "OK").sum()),
-        "failed_ohlcv": int((master["fetch_status"] == "ERROR").sum()),
-        "nse_daily_rows": len(daily),
-        "amfi_rows": len(amfi),
-    }
-    pd.DataFrame([summary]).to_csv(
-        OUT / "collection_summary.csv",
-        index=False,
-    )
-
-    print("\nDONE")
-    print(f"Master: {OUT / 'master_stock_data.csv'}")
-    print(f"Errors: {OUT / 'collection_errors.csv'}")
-    print(f"Summary: {OUT / 'collection_summary.csv'}")
-    print(f"OHLCV: {HISTORY}")
+    print()
+    print("Collection complete.")
+    print(f"Master: {DATA_DIR / 'stock_master_data.csv'}")
+    print(f"History: {HISTORY_DIR}")
+    print(f"Errors: {DATA_DIR / 'collection_errors.csv'}")
+    print(f"Rows collected: {len(master)}")
+    print(f"Successful: {(master['fetch_status'] == 'OK').sum()}")
+    print(f"Failed: {(master['fetch_status'] == 'ERROR').sum()}")
 
 
 if __name__ == "__main__":
